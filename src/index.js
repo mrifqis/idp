@@ -11,6 +11,16 @@ const {
 const { getSession, resetSession } = require('./session');
 const { clean, escapeMarkdown, splitLongText } = require('./utils');
 
+const fs = require('fs');
+
+const {
+  createPrintSession,
+  getPrintSession,
+  clearPrintSession,
+} = require('./printSession');
+
+const { generateIdpDocx } = require('./generateDocx');
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const PELAKSANA_NOMENKLATUR = [
@@ -59,6 +69,29 @@ function menuJenisKompetensi(jabatan) {
   rows.push([Markup.button.callback('Kembali', 'BACK_TO_PREV')]);
 
   return Markup.inlineKeyboard(rows);
+}
+
+function menuCetakJabatan() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Pelaksana/AR/PK/Juru Sita', 'CETAK_JAB_PEL')],
+    [Markup.button.callback('Kasi', 'CETAK_JAB_KASI')],
+  ]);
+}
+
+function menuCetakNomenklatur() {
+  return buildIndexedMenu(PELAKSANA_NOMENKLATUR, 'CETAK_NOM', 'CETAK_BATAL');
+}
+
+function menuCetakKompetensiTeknis(options) {
+  return buildIndexedMenu(options, 'CETAK_TEKNIS', 'CETAK_BATAL');
+}
+
+function menuCetakKompetensiManajerial(options) {
+  return buildIndexedMenu(options, 'CETAK_MANAJERIAL', 'CETAK_BATAL');
+}
+
+function menuCetakKompetensiSosial(options) {
+  return buildIndexedMenu(options, 'CETAK_SOSIAL', 'CETAK_BATAL');
 }
 
 async function sendMainMenu(ctx) {
@@ -280,8 +313,242 @@ bot.action('BACK_TO_PREV', async (ctx) => {
   return sendMainMenu(ctx);
 });
 
+bot.command('cetak', async (ctx) => {
+  createPrintSession(ctx.from.id);
+  await ctx.reply('Masukkan Nama Pegawai:');
+});
+
+bot.action('CETAK_BATAL', async (ctx) => {
+  clearPrintSession(ctx.from.id);
+  await ctx.answerCbQuery();
+  await ctx.reply('Proses /cetak dibatalkan.');
+});
+
+bot.action('CETAK_JAB_PEL', async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  session.data.jabatanAwal = 'Pelaksana';
+  session.data.level = 1;
+  session.step = 'cetak_pilih_nomenklatur';
+
+  await ctx.answerCbQuery();
+  await ctx.reply('Pilih Nomenklatur untuk Kompetensi Teknis:', menuCetakNomenklatur());
+});
+
+bot.action('CETAK_JAB_KASI', async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  session.data.jabatanAwal = 'Kasi';
+  session.data.level = 2;
+  session.data.nomenklatur = '';
+  session.data.target[0].unitKompetensi = '-';
+  session.data.target[0].level = '-';
+  session.data.target[0].indikator = '-';
+
+  const manajerialList = getManajerialKompetensiList();
+  session.options.manajerial = manajerialList;
+  session.step = 'cetak_pilih_manajerial';
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Data Kompetensi Teknis untuk Kasi belum tersedia, dilanjutkan ke Kompetensi Manajerial.\n\nPilih Unit Kompetensi Manajerial:',
+    menuCetakKompetensiManajerial(manajerialList)
+  );
+});
+
+bot.action(/^CETAK_NOM_(\d+)$/, async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  const index = Number(ctx.match[1]);
+  const nomenklatur = PELAKSANA_NOMENKLATUR[index];
+  if (!nomenklatur) return ctx.reply('Pilihan nomenklatur tidak valid.');
+
+  session.data.nomenklatur = nomenklatur;
+
+  const teknisList = getTeknisKompetensiByNomenklatur(nomenklatur);
+  session.options.teknis = teknisList;
+  session.step = 'cetak_pilih_teknis';
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `Pilih Unit Kompetensi Teknis untuk ${nomenklatur}:`,
+    menuCetakKompetensiTeknis(teknisList)
+  );
+});
+
+bot.action(/^CETAK_TEKNIS_(\d+)$/, async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  const index = Number(ctx.match[1]);
+  const selected = session.options.teknis[index];
+  if (!selected) return ctx.reply('Pilihan kompetensi teknis tidak valid.');
+
+  const detail = getTeknisDetail(session.data.nomenklatur, selected);
+  if (!detail) return ctx.reply('Detail kompetensi teknis tidak ditemukan.');
+
+  session.data.target[0].unitKompetensi = detail.kompetensi;
+  session.data.target[0].level = detail.level;
+  session.data.target[0].indikator = detail.indikator;
+
+  const manajerialList = getManajerialKompetensiList();
+  session.options.manajerial = manajerialList;
+  session.step = 'cetak_pilih_manajerial';
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Pilih Unit Kompetensi Manajerial:',
+    menuCetakKompetensiManajerial(manajerialList)
+  );
+});
+
+bot.action(/^CETAK_MANAJERIAL_(\d+)$/, async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  const index = Number(ctx.match[1]);
+  const selected = session.options.manajerial[index];
+  if (!selected) return ctx.reply('Pilihan kompetensi manajerial tidak valid.');
+
+  const detail = getManajerialDetail(selected, session.data.level);
+  if (!detail) return ctx.reply('Detail kompetensi manajerial tidak ditemukan.');
+
+  session.data.target[1].unitKompetensi = detail.kompetensi;
+  session.data.target[1].level = detail.level;
+  session.data.target[1].indikator = detail.indikator;
+
+  const sosialList = getSosialKompetensiList();
+  session.options.sosial = sosialList;
+  session.step = 'cetak_pilih_sosial';
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Pilih Unit Kompetensi Sosial Kultural:',
+    menuCetakKompetensiSosial(sosialList)
+  );
+});
+
+bot.action(/^CETAK_SOSIAL_(\d+)$/, async (ctx) => {
+  const session = getPrintSession(ctx.from.id);
+  if (!session) return;
+
+  const index = Number(ctx.match[1]);
+  const selected = session.options.sosial[index];
+  if (!selected) return ctx.reply('Pilihan kompetensi sosial kultural tidak valid.');
+
+  const detail = getSosialDetail(selected, session.data.level);
+  if (!detail) return ctx.reply('Detail kompetensi sosial kultural tidak ditemukan.');
+
+  session.data.target[2].unitKompetensi = detail.kompetensi;
+  session.data.target[2].level = detail.level;
+  session.data.target[2].indikator = detail.indikator;
+
+  try {
+    const result = generateIdpDocx(session.data);
+
+    await ctx.answerCbQuery();
+    await ctx.reply('Dokumen berhasil dibuat. Berikut file-nya:');
+    await ctx.replyWithDocument({
+      source: result.outputPath,
+      filename: result.fileName,
+    });
+
+    if (fs.existsSync(result.outputPath)) {
+      fs.unlinkSync(result.outputPath);
+    }
+
+    clearPrintSession(ctx.from.id);
+  } catch (error) {
+    console.error(error);
+    await ctx.answerCbQuery();
+    await ctx.reply('Terjadi kesalahan saat membuat dokumen.');
+  }
+});
+
 bot.on('text', async (ctx) => {
-  await ctx.reply('Silakan gunakan /start atau /menu untuk memulai.');
+  const printSession = getPrintSession(ctx.from.id);
+
+  if (printSession && printSession.mode === 'cetak') {
+    const text = ctx.message.text.trim();
+
+    switch (printSession.step) {
+      case 'pegawai_nama':
+        printSession.data.pegawai.nama = text;
+        printSession.step = 'pegawai_nip';
+        return ctx.reply('Masukkan NIP Pegawai:');
+
+      case 'pegawai_nip':
+        printSession.data.pegawai.nip = text;
+        printSession.step = 'pegawai_jabatan';
+        return ctx.reply('Masukkan Jabatan Pegawai:');
+
+      case 'pegawai_jabatan':
+        printSession.data.pegawai.jabatan = text;
+        printSession.step = 'pegawai_unit_organisasi';
+        return ctx.reply('Masukkan Unit Organisasi Pegawai:');
+
+      case 'pegawai_unit_organisasi':
+        printSession.data.pegawai.unitOrganisasi = text;
+        printSession.step = 'pegawai_unit_kerja';
+        return ctx.reply('Masukkan Unit Kerja Pegawai:');
+
+      case 'pegawai_unit_kerja':
+        printSession.data.pegawai.unitKerja = text;
+        printSession.step = 'atasan_nama';
+        return ctx.reply('Masukkan Nama Atasan:');
+
+      case 'atasan_nama':
+        printSession.data.atasan.nama = text;
+        printSession.step = 'atasan_nip';
+        return ctx.reply('Masukkan NIP Atasan:');
+
+      case 'atasan_nip':
+        printSession.data.atasan.nip = text;
+        printSession.step = 'atasan_jabatan';
+        return ctx.reply('Masukkan Jabatan Atasan:');
+
+      case 'atasan_jabatan':
+        printSession.data.atasan.jabatan = text;
+        printSession.step = 'atasan_unit_organisasi';
+        return ctx.reply('Masukkan Unit Organisasi Atasan:');
+
+      case 'atasan_unit_organisasi':
+        printSession.data.atasan.unitOrganisasi = text;
+        printSession.step = 'atasan_unit_kerja';
+        return ctx.reply('Masukkan Unit Kerja Atasan:');
+
+      case 'atasan_unit_kerja':
+        printSession.data.atasan.unitKerja = text;
+        printSession.step = 'kekuatan';
+        return ctx.reply('Masukkan Kekuatan:');
+
+      case 'kekuatan':
+        printSession.data.analisis.kekuatan = text;
+        printSession.step = 'kelemahan';
+        return ctx.reply('Masukkan Kelemahan:');
+
+      case 'kelemahan':
+        printSession.data.analisis.kelemahan = text;
+        printSession.step = 'tanggal_diskusi';
+        return ctx.reply('Masukkan Tanggal Diskusi Penyusunan IDP:');
+
+      case 'tanggal_diskusi':
+        printSession.data.tanggalDiskusi = text;
+        printSession.step = 'pilih_jabatan_awal';
+        return ctx.reply(
+          'Pilih jabatan awal untuk penentuan level dan kompetensi:',
+          menuCetakJabatan()
+        );
+
+      default:
+        return ctx.reply('Lanjutkan proses /cetak atau gunakan /cetak untuk mulai ulang.');
+    }
+  }
+
+  await ctx.reply('Silakan gunakan /start, /menu, atau /cetak.');
 });
 
 bot.launch();
